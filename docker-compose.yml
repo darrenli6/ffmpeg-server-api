@@ -1,0 +1,13 @@
+services:
+  video-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: video-ffmpeg-api
+    env_file:
+      - .env
+    environment:
+      FFMPEG_BIN: /usr/bin/ffmpeg
+    ports:
+      - "8001:8000"
+    restart: unless-stopped

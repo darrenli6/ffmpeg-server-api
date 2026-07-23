@@ -1,0 +1,8 @@
+.env
+.git
+.gitignore
+__pycache__/
+*.pyc
+output.mp4
+tmp/
+.DS_Store
