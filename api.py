@@ -51,9 +51,25 @@ db_pool: asyncpg.Pool | None = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global db_pool
-    db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=10)
+    logger.info(
+        "startup config: postgres_url_configured=%s aws_key_configured=%s "
+        "aws_secret_configured=%s s3_bucket_configured=%s ffmpeg_bin=%s",
+        bool(POSTGRES_URL),
+        bool(AWS_ACCESS_KEY_ID),
+        bool(AWS_SECRET_ACCESS_KEY),
+        bool(S3_BUCKET),
+        FFMPEG_BIN,
+    )
+    try:
+        db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=10)
+        logger.info("startup database pool: connected")
+    except Exception:
+        logger.exception("startup database pool: connection failed")
+        raise
     yield
-    await db_pool.close()
+    if db_pool:
+        await db_pool.close()
+        logger.info("shutdown database pool: closed")
 
 
 app = FastAPI(title="FFmpeg 视频合并服务", lifespan=lifespan)
@@ -280,25 +296,58 @@ async def start_process(req: ProcessRequest, background_tasks: BackgroundTasks):
     提交合并任务，立即返回 sub_id 和初始状态 pending。
     后台异步下载 → ffmpeg 合并 → 上传 S3 → 更新状态。
     """
-    sub_id = str(uuid.uuid4())
-
-    async with db_pool.acquire() as conn:
-        await conn.execute(
-            """
-            INSERT INTO "ffmpeg_process_sub" (id, main_id, name, status)
-            VALUES ($1, $2, $3, $4)
-            """,
-            uuid.UUID(sub_id),
-            uuid.UUID(req.main_id),
-            "video_merge",
-            "pending",
-        )
-
-    background_tasks.add_task(
-        _process_task, sub_id, req.main_id, req.ass_url, req.mp3_url, req.mp4_url, req.music_url
+    logger.info(
+        "process request: main_id=%r main_id_length=%d ass_url=%s mp3_url=%s "
+        "mp4_url=%s music_url=%s",
+        req.main_id,
+        len(req.main_id),
+        bool(req.ass_url),
+        bool(req.mp3_url),
+        bool(req.mp4_url),
+        bool(req.music_url),
     )
+    sub_id = str(uuid.uuid4())
+    try:
+        main_uuid = uuid.UUID(req.main_id)
+        logger.info("process validation: main_id_is_valid_uuid=true sub_id=%s", sub_id)
 
-    return {"sub_id": sub_id, "main_id": req.main_id, "status": "pending"}
+        if db_pool is None:
+            raise RuntimeError("database pool is not initialized")
+
+        logger.info("process database insert: start sub_id=%s", sub_id)
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO "ffmpeg_process_sub" (id, main_id, name, status)
+                VALUES ($1, $2, $3, $4)
+                """,
+                uuid.UUID(sub_id),
+                main_uuid,
+                "video_merge",
+                "pending",
+            )
+        logger.info("process database insert: success sub_id=%s", sub_id)
+
+        background_tasks.add_task(
+            _process_task, sub_id, req.main_id, req.ass_url, req.mp3_url, req.mp4_url, req.music_url
+        )
+        logger.info("process background task: scheduled sub_id=%s", sub_id)
+        return {"sub_id": sub_id, "main_id": req.main_id, "status": "pending"}
+    except ValueError:
+        logger.exception(
+            "process validation failed: invalid main_id main_id=%r "
+            "main_id_length=%d sub_id=%s",
+            req.main_id,
+            len(req.main_id),
+            sub_id,
+        )
+        raise HTTPException(
+            status_code=422,
+            detail="main_id 必须是合法的 UUID",
+        )
+    except Exception:
+        logger.exception("process request failed: sub_id=%s", sub_id)
+        raise
 
 
 @app.get("/status/{main_id}", summary="查询任务状态")
