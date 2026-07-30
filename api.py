@@ -13,13 +13,18 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import urllib.request
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import uuid
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
 import asyncpg
 import boto3
+from boto3.s3.transfer import TransferConfig
 import ffmpeg
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
@@ -90,10 +95,39 @@ class ProcessRequest(BaseModel):
     music_url: Optional[str] = None
 
 
+class ProcessV1Request(BaseModel):
+    main_id: str
+    mp4_urls: list[str]   # 按顺序拼接的 MP4 URL 列表
+    mp3_url: str          # 背景音乐
+
+
 # ---------- 工具函数（同步，在线程池中执行）----------
 
-def _download(url: str, dest: str) -> None:
-    urllib.request.urlretrieve(url, dest)
+def _download(url: str, dest: str, retries: int = 3) -> None:
+    """下载文件，自动重试以应对 SSL EOF 等瞬时网络错误"""
+    session = requests.Session()
+    adapter = HTTPAdapter(max_retries=Retry(
+        total=retries,
+        backoff_factor=2,
+        status_forcelist=[500, 502, 503, 504],
+    ))
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+    for attempt in range(1, retries + 2):
+        try:
+            with session.get(url, stream=True, timeout=60) as resp:
+                resp.raise_for_status()
+                with open(dest, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
+                        f.write(chunk)
+            return
+        except Exception as e:
+            if attempt > retries:
+                raise
+            wait = 2 ** attempt
+            logger.warning("download attempt %d failed (%s), retry in %ds: %s", attempt, e, wait, url)
+            time.sleep(wait)
 
 
 def _get_duration(path: str) -> float:
@@ -171,28 +205,56 @@ def _merge(mp4_path: str, mp3_path: str, ass_path: str, output: str, work_dir: s
 
 
 class _S3ProgressLogger:
-    def __init__(self, file_path: str, log_every_bytes: int = 5 * 1024 * 1024):
-        self.file_path = file_path
+    def __init__(self, file_path: str, s3_key: str, log_interval_bytes: int = 2 * 1024 * 1024):
+        self.s3_key = s3_key
         self.total = os.path.getsize(file_path)
         self.transferred = 0
-        self.next_log_at = log_every_bytes
-        self.log_every_bytes = log_every_bytes
+        self.next_log_at = log_interval_bytes
+        self.log_interval_bytes = log_interval_bytes
+        self.start_time = time.monotonic()
 
     def __call__(self, bytes_amount: int) -> None:
         self.transferred += bytes_amount
-        if self.transferred >= self.next_log_at or self.transferred >= self.total:
+        done = self.transferred >= self.total
+        if self.transferred >= self.next_log_at or done:
+            elapsed = time.monotonic() - self.start_time
             percent = (self.transferred / self.total * 100) if self.total else 100
+            speed_mb = (self.transferred / elapsed / 1024 / 1024) if elapsed > 0 else 0
+            transferred_mb = min(self.transferred, self.total) / 1024 / 1024
+            total_mb = self.total / 1024 / 1024
+            eta = ((self.total - self.transferred) / (self.transferred / elapsed)) if (elapsed > 0 and self.transferred < self.total) else 0
             logger.info(
-                "s3 upload progress: %s/%s bytes %.1f%%",
-                min(self.transferred, self.total),
-                self.total,
+                "s3 upload progress: key=%s  %.1f/%.1f MB  %.1f%%  speed=%.1f MB/s  eta=%.0fs",
+                self.s3_key,
+                transferred_mb,
+                total_mb,
                 percent,
+                speed_mb,
+                eta,
             )
-            self.next_log_at += self.log_every_bytes
+            self.next_log_at += self.log_interval_bytes
+            if done:
+                elapsed_total = time.monotonic() - self.start_time
+                avg_speed = self.total / elapsed_total / 1024 / 1024 if elapsed_total > 0 else 0
+                logger.info(
+                    "s3 upload done: key=%s  total=%.1f MB  elapsed=%.1fs  avg_speed=%.1f MB/s",
+                    self.s3_key,
+                    total_mb,
+                    elapsed_total,
+                    avg_speed,
+                )
+
+
+_S3_TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=8 * 1024 * 1024,   # 文件 > 8MB 启用分片
+    multipart_chunksize=8 * 1024 * 1024,   # 每片 8MB
+    max_concurrency=10,                     # 最多 10 个并发线程同时上传
+    use_threads=True,
+)
 
 
 def _upload_s3(file_path: str, s3_key: str) -> str:
-    """上传文件到 S3，返回公开访问 URL"""
+    """上传文件到 S3，返回公开访问 URL（多线程分片并发加速）"""
     file_size = os.path.getsize(file_path)
     logger.info(
         "s3 upload start: file=%s size=%s bucket=%s key=%s",
@@ -207,10 +269,85 @@ def _upload_s3(file_path: str, s3_key: str) -> str:
         aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
         region_name=AWS_REGION,
     )
-    s3.upload_file(file_path, S3_BUCKET, s3_key, Callback=_S3ProgressLogger(file_path))
+    s3.upload_file(
+        file_path, S3_BUCKET, s3_key,
+        Config=_S3_TRANSFER_CONFIG,
+        Callback=_S3ProgressLogger(file_path, s3_key),
+    )
     url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
     logger.info("s3 upload completed: url=%s", url)
     return url
+
+
+# ---------- 工具函数：V1 ----------
+
+def _concat_mp4s(video_paths: list[str], output: str, work_dir: str) -> None:
+    """用 ffmpeg concat demuxer 按顺序拼接多个 MP4（直接 copy，不重编码）"""
+    list_file = os.path.join(work_dir, "concat_list.txt")
+    with open(list_file, "w") as f:
+        for p in video_paths:
+            f.write(f"file '{p}'\n")
+
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",
+        output,
+    ]
+    logger.info("ffmpeg concat start: %s", shlex.join(cmd))
+    process = subprocess.Popen(
+        cmd, cwd=work_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    log_tail: list[str] = []
+    if process.stdout:
+        for line in process.stdout:
+            msg = line.rstrip()
+            if msg:
+                logger.info("ffmpeg: %s", msg)
+                log_tail.append(msg)
+                log_tail = log_tail[-50:]
+    rc = process.wait()
+    logger.info("ffmpeg concat finished: returncode=%s output=%s", rc, output)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg concat 失败 returncode={rc}:\n" + "\n".join(log_tail))
+
+
+def _mix_background_music(video_path: str, music_path: str, output: str, work_dir: str) -> None:
+    """将背景音乐循环填充至视频时长，作为唯一音轨写入输出"""
+    duration = _get_duration(video_path)
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-i", video_path,
+        "-stream_loop", "-1",
+        "-i", music_path,
+        "-t", str(duration),
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-vcodec", "libx264",
+        "-acodec", "aac",
+        output,
+    ]
+    logger.info("ffmpeg mix music start: duration=%.2f %s", duration, shlex.join(cmd))
+    process = subprocess.Popen(
+        cmd, cwd=work_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    log_tail: list[str] = []
+    if process.stdout:
+        for line in process.stdout:
+            msg = line.rstrip()
+            if msg:
+                logger.info("ffmpeg: %s", msg)
+                log_tail.append(msg)
+                log_tail = log_tail[-50:]
+    rc = process.wait()
+    logger.info("ffmpeg mix music finished: returncode=%s output=%s", rc, output)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg 混音失败 returncode={rc}:\n" + "\n".join(log_tail))
 
 
 # ---------- 后台任务 ----------
@@ -288,6 +425,75 @@ async def _process_task(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
+async def _process_v1_task(
+    sub_id: str,
+    main_id: str,
+    mp4_urls: list[str],
+    mp3_url: str,
+) -> None:
+    pool = db_pool
+    tmp_dir = tempfile.mkdtemp(prefix=f"ffmpegv1_{sub_id}_")
+    loop = asyncio.get_event_loop()
+    now = lambda: datetime.now(UTC).replace(tzinfo=None)
+
+    try:
+        logger.info(
+            "v1 task started: sub_id=%s main_id=%s mp4_count=%d tmp_dir=%s",
+            sub_id, main_id, len(mp4_urls), tmp_dir,
+        )
+        await pool.execute(
+            'UPDATE "ffmpeg_process_sub" SET status=$1, "updateAt"=$2 WHERE id=$3',
+            "processing", now(), uuid.UUID(sub_id),
+        )
+
+        # 准备文件路径
+        mp4_paths = [os.path.join(tmp_dir, f"input_{i:03d}.mp4") for i in range(len(mp4_urls))]
+        mp3_path = os.path.join(tmp_dir, "music.mp3")
+        concat_path = os.path.join(tmp_dir, "concat.mp4")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+
+        # 并行下载所有 MP4 + MP3
+        logger.info("v1 download start: sub_id=%s", sub_id)
+        downloads = [loop.run_in_executor(None, _download, url, path) for url, path in zip(mp4_urls, mp4_paths)]
+        downloads.append(loop.run_in_executor(None, _download, mp3_url, mp3_path))
+        await asyncio.gather(*downloads)
+        logger.info(
+            "v1 download completed: sub_id=%s mp4_sizes=%s mp3_size=%s",
+            sub_id,
+            [os.path.getsize(p) for p in mp4_paths],
+            os.path.getsize(mp3_path),
+        )
+
+        # 拼接 MP4
+        await loop.run_in_executor(None, _concat_mp4s, mp4_paths, concat_path, tmp_dir)
+
+        # 混入背景音乐
+        await loop.run_in_executor(None, _mix_background_music, concat_path, mp3_path, output_path, tmp_dir)
+
+        # 上传 S3
+        s3_key = f"ffmpeg-output/{main_id}/{sub_id}.mp4"
+        s3_url = await loop.run_in_executor(None, _upload_s3, output_path, s3_key)
+
+        await pool.execute(
+            'UPDATE "ffmpeg_process_sub" SET status=$1, payload=$2, "updateAt"=$3 WHERE id=$4',
+            "completed",
+            json.dumps({"s3_url": s3_url}),
+            now(),
+            uuid.UUID(sub_id),
+        )
+        logger.info("v1 task completed: sub_id=%s s3_url=%s", sub_id, s3_url)
+
+    except Exception as exc:
+        logger.exception("v1 task failed: sub_id=%s main_id=%s", sub_id, main_id)
+        await pool.execute(
+            'UPDATE "ffmpeg_process_sub" SET status=$1, error_message=$2, "updateAt"=$3 WHERE id=$4',
+            "failed", str(exc), now(), uuid.UUID(sub_id),
+        )
+
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ---------- 接口 ----------
 
 @app.post("/process", summary="提交视频合并任务（异步）")
@@ -347,6 +553,49 @@ async def start_process(req: ProcessRequest, background_tasks: BackgroundTasks):
         )
     except Exception:
         logger.exception("process request failed: sub_id=%s", sub_id)
+        raise
+
+
+@app.post("/processV1", summary="多 MP4 顺序拼接 + 背景音乐（异步）")
+async def start_process_v1(req: ProcessV1Request, background_tasks: BackgroundTasks):
+    """
+    提交多视频拼接任务，立即返回 sub_id 和初始状态 pending。
+    后台流程：并行下载所有 MP4 → 按顺序拼接 → 混入背景音乐 → 上传 S3 → 更新状态。
+    可通过 GET /status/{main_id} 轮询结果。
+    """
+    if not req.mp4_urls:
+        raise HTTPException(status_code=422, detail="mp4_urls 不能为空")
+
+    logger.info(
+        "processV1 request: main_id=%r mp4_count=%d mp3_url=%s",
+        req.main_id, len(req.mp4_urls), bool(req.mp3_url),
+    )
+    sub_id = str(uuid.uuid4())
+    try:
+        main_uuid = uuid.UUID(req.main_id)
+
+        if db_pool is None:
+            raise RuntimeError("database pool is not initialized")
+
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO "ffmpeg_process_sub" (id, main_id, name, status)
+                VALUES ($1, $2, $3, $4)
+                """,
+                uuid.UUID(sub_id),
+                main_uuid,
+                "video_concat_v1",
+                "pending",
+            )
+
+        background_tasks.add_task(_process_v1_task, sub_id, req.main_id, req.mp4_urls, req.mp3_url)
+        logger.info("processV1 background task scheduled: sub_id=%s", sub_id)
+        return {"sub_id": sub_id, "main_id": req.main_id, "status": "pending"}
+    except ValueError:
+        raise HTTPException(status_code=422, detail="main_id 必须是合法的 UUID")
+    except Exception:
+        logger.exception("processV1 request failed: sub_id=%s", sub_id)
         raise
 
 
