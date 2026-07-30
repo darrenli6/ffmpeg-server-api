@@ -112,6 +112,12 @@ uvicorn api:app --host 0.0.0.0 --port 8000 --reload
 docker compose up -d --build
 ```
 
+代码更新后，可以使用项目脚本自动重建镜像并重新创建容器：
+
+```bash
+./rebuild-and-restart.sh
+```
+
 API 地址为 <http://localhost:8001>。FFmpeg 已安装在同一个容器中，不需要单独启动 FFmpeg 服务。
 
 查看日志：
