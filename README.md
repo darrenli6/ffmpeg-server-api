@@ -11,7 +11,7 @@ If this project helps you, please consider giving it a star.
 ## Features
 
 - Asynchronous video processing
-- Loops video to match the audio duration
+- Generates a configurable video duration (60 seconds by default)
 - Replaces the original audio track
 - Burns ASS subtitles with CJK font support
 - Optional background music mixing

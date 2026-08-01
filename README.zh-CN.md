@@ -173,14 +173,15 @@ curl http://localhost:8001/status/11111111-1111-1111-1111-111111111111
 
 ### 图片 + MP3 生成视频
 
-`/pictovideo` 接收一张图片 URL 和一个 MP3 URL。图片会保持静态，视频时长以 MP3 时长为准，任务完成后视频上传到 S3。
+`/pictovideo` 接收一张图片 URL、一个 MP3 URL，以及可选的视频时长 `seconds`。图片会保持静态，视频默认生成 60 秒；MP3 会循环或截断以匹配指定时长，任务完成后视频上传到 S3。
 
 ```bash
 curl -X POST http://localhost:8001/pictovideo \
   -H "Content-Type: application/json" \
   -d '{
     "image_url": "https://example.com/image.jpg",
-    "mp3_url": "https://example.com/music.mp3"
+    "mp3_url": "https://example.com/music.mp3",
+    "seconds": 60
   }'
 ```
 

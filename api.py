@@ -2,7 +2,7 @@
 FastAPI 视频合并服务
 - POST /process       接收 ass/mp3/mp4 URL + main_id，异步处理并上传 S3
 - POST /processV1     顺序拼接多个 MP4 并混入背景音乐
-- POST /pictovideo    接收图片 URL + MP3 URL，生成静态图片视频
+- POST /pictovideo    接收图片 URL + MP3 URL + 可选 seconds，生成静态图片视频
 - GET  /status/{id}   查询任务状态及 S3 地址
 """
 
@@ -31,7 +31,7 @@ from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -74,6 +74,7 @@ async def lifespan(app: FastAPI):
                 "id" uuid PRIMARY KEY,
                 "image_url" text NOT NULL,
                 "mp3_url" text NOT NULL,
+                "seconds" integer NOT NULL DEFAULT 60,
                 "status" varchar(20) NOT NULL,
                 "payload" jsonb,
                 "error_message" text,
@@ -81,6 +82,9 @@ async def lifespan(app: FastAPI):
                 "updateAt" timestamp DEFAULT now() NOT NULL
             )
             '''
+        )
+        await db_pool.execute(
+            'ALTER TABLE "pictovideo_tasks" ADD COLUMN IF NOT EXISTS "seconds" integer NOT NULL DEFAULT 60'
         )
         logger.info("startup database pool: connected")
     except Exception:
@@ -119,6 +123,7 @@ class ProcessV1Request(BaseModel):
 class PictoVideoRequest(BaseModel):
     image_url: str        # 图片地址
     mp3_url: str          # 背景音乐地址
+    seconds: int = Field(default=60, gt=0)  # 视频时长（秒）
 
 
 # ---------- 工具函数（同步，在线程池中执行）----------
@@ -370,13 +375,14 @@ def _mix_background_music(video_path: str, music_path: str, output: str, work_di
         raise RuntimeError(f"ffmpeg 混音失败 returncode={rc}:\n" + "\n".join(log_tail))
 
 
-def _image_to_video(image_path: str, mp3_path: str, output: str, work_dir: str) -> None:
-    """将一张图片延展为 MP3 时长的视频，并写入 MP3 作为音轨。"""
-    duration = _get_duration(mp3_path)
+def _image_to_video(image_path: str, mp3_path: str, output: str, work_dir: str, seconds: int) -> None:
+    """将一张图片延展为指定时长的视频，并循环/截断 MP3 作为音轨。"""
+    duration = float(seconds)
     cmd = [
         FFMPEG_BIN, "-y",
         "-loop", "1",
         "-i", image_path,
+        "-stream_loop", "-1",
         "-i", mp3_path,
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -411,7 +417,7 @@ def _image_to_video(image_path: str, mp3_path: str, output: str, work_dir: str) 
         raise RuntimeError(f"ffmpeg 图片转视频失败 returncode={rc}:\n" + "\n".join(log_tail))
 
 
-async def _process_pictovideo_task(task_id: str, image_url: str, mp3_url: str) -> None:
+async def _process_pictovideo_task(task_id: str, image_url: str, mp3_url: str, seconds: int) -> None:
     pool = db_pool
     tmp_dir = tempfile.mkdtemp(prefix=f"pictovideo_{task_id}_")
     loop = asyncio.get_event_loop()
@@ -430,7 +436,9 @@ async def _process_pictovideo_task(task_id: str, image_url: str, mp3_url: str) -
             loop.run_in_executor(None, _download, image_url, image_path),
             loop.run_in_executor(None, _download, mp3_url, mp3_path),
         )
-        await loop.run_in_executor(None, _image_to_video, image_path, mp3_path, output_path, tmp_dir)
+        await loop.run_in_executor(
+            None, _image_to_video, image_path, mp3_path, output_path, tmp_dir, seconds
+        )
 
         s3_key = f"pictovideo-output/{task_id}.mp4"
         s3_url = await loop.run_in_executor(None, _upload_s3, output_path, s3_key)
@@ -709,12 +717,14 @@ async def start_pictovideo(req: PictoVideoRequest, background_tasks: BackgroundT
         async with db_pool.acquire() as conn:
             await conn.execute(
                 '''
-                INSERT INTO "pictovideo_tasks" (id, image_url, mp3_url, status)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO "pictovideo_tasks" (id, image_url, mp3_url, seconds, status)
+                VALUES ($1, $2, $3, $4, $5)
                 ''',
-                uuid.UUID(task_id), req.image_url, req.mp3_url, "pending",
+                uuid.UUID(task_id), req.image_url, req.mp3_url, req.seconds, "pending",
             )
-        background_tasks.add_task(_process_pictovideo_task, task_id, req.image_url, req.mp3_url)
+        background_tasks.add_task(
+            _process_pictovideo_task, task_id, req.image_url, req.mp3_url, req.seconds
+        )
         return {"id": task_id, "status": "pending"}
     except Exception:
         logger.exception("pictovideo request failed: id=%s", task_id)
