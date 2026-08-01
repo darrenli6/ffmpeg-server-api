@@ -1,8 +1,9 @@
 """
 FastAPI 视频合并服务
-- POST /process  接收 ass/mp3/mp4 URL + main_id，异步处理并上传 S3
-- GET  /status/{main_id}  查询处理状态及 S3 地址
-状态写入 ffmpeg_process_sub 表
+- POST /process       接收 ass/mp3/mp4 URL + main_id，异步处理并上传 S3
+- POST /processV1     顺序拼接多个 MP4 并混入背景音乐
+- POST /pictovideo    接收图片 URL + MP3 URL，生成静态图片视频
+- GET  /status/{id}   查询任务状态及 S3 地址
 """
 
 import asyncio
@@ -67,6 +68,20 @@ async def lifespan(app: FastAPI):
     )
     try:
         db_pool = await asyncpg.create_pool(POSTGRES_URL, min_size=1, max_size=10)
+        await db_pool.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS "pictovideo_tasks" (
+                "id" uuid PRIMARY KEY,
+                "image_url" text NOT NULL,
+                "mp3_url" text NOT NULL,
+                "status" varchar(20) NOT NULL,
+                "payload" jsonb,
+                "error_message" text,
+                "createAt" timestamp DEFAULT now() NOT NULL,
+                "updateAt" timestamp DEFAULT now() NOT NULL
+            )
+            '''
+        )
         logger.info("startup database pool: connected")
     except Exception:
         logger.exception("startup database pool: connection failed")
@@ -99,6 +114,11 @@ class ProcessV1Request(BaseModel):
     main_id: str
     mp4_urls: list[str]   # 按顺序拼接的 MP4 URL 列表
     mp3_url: str          # 背景音乐
+
+
+class PictoVideoRequest(BaseModel):
+    image_url: str        # 图片地址
+    mp3_url: str          # 背景音乐地址
 
 
 # ---------- 工具函数（同步，在线程池中执行）----------
@@ -350,6 +370,85 @@ def _mix_background_music(video_path: str, music_path: str, output: str, work_di
         raise RuntimeError(f"ffmpeg 混音失败 returncode={rc}:\n" + "\n".join(log_tail))
 
 
+def _image_to_video(image_path: str, mp3_path: str, output: str, work_dir: str) -> None:
+    """将一张图片延展为 MP3 时长的视频，并写入 MP3 作为音轨。"""
+    duration = _get_duration(mp3_path)
+    cmd = [
+        FFMPEG_BIN, "-y",
+        "-loop", "1",
+        "-i", image_path,
+        "-i", mp3_path,
+        "-map", "0:v:0",
+        "-map", "1:a:0",
+        "-t", str(duration),
+        "-r", "30",
+        # yuv420p/libx264 要求宽高均为偶数；奇数边最多裁掉 1 像素。
+        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+        "-c:v", "libx264",
+        "-tune", "stillimage",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "192k",
+        output,
+    ]
+    logger.info("ffmpeg pictovideo start: duration=%.2f %s", duration, shlex.join(cmd))
+    process = subprocess.Popen(
+        cmd, cwd=work_dir,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1,
+    )
+    log_tail: list[str] = []
+    if process.stdout:
+        for line in process.stdout:
+            msg = line.rstrip()
+            if msg:
+                logger.info("ffmpeg: %s", msg)
+                log_tail.append(msg)
+                log_tail = log_tail[-50:]
+    rc = process.wait()
+    logger.info("ffmpeg pictovideo finished: returncode=%s output=%s", rc, output)
+    if rc != 0:
+        raise RuntimeError(f"ffmpeg 图片转视频失败 returncode={rc}:\n" + "\n".join(log_tail))
+
+
+async def _process_pictovideo_task(task_id: str, image_url: str, mp3_url: str) -> None:
+    pool = db_pool
+    tmp_dir = tempfile.mkdtemp(prefix=f"pictovideo_{task_id}_")
+    loop = asyncio.get_event_loop()
+    now = lambda: datetime.now(UTC).replace(tzinfo=None)
+
+    try:
+        await pool.execute(
+            'UPDATE "pictovideo_tasks" SET status=$1, "updateAt"=$2 WHERE id=$3',
+            "processing", now(), uuid.UUID(task_id),
+        )
+        image_path = os.path.join(tmp_dir, "input_image")
+        mp3_path = os.path.join(tmp_dir, "input.mp3")
+        output_path = os.path.join(tmp_dir, "output.mp4")
+
+        await asyncio.gather(
+            loop.run_in_executor(None, _download, image_url, image_path),
+            loop.run_in_executor(None, _download, mp3_url, mp3_path),
+        )
+        await loop.run_in_executor(None, _image_to_video, image_path, mp3_path, output_path, tmp_dir)
+
+        s3_key = f"pictovideo-output/{task_id}.mp4"
+        s3_url = await loop.run_in_executor(None, _upload_s3, output_path, s3_key)
+        await pool.execute(
+            'UPDATE "pictovideo_tasks" SET status=$1, payload=$2, "updateAt"=$3 WHERE id=$4',
+            "completed", json.dumps({"s3_url": s3_url}), now(), uuid.UUID(task_id),
+        )
+        logger.info("pictovideo task completed: id=%s s3_url=%s", task_id, s3_url)
+    except Exception as exc:
+        logger.exception("pictovideo task failed: id=%s", task_id)
+        await pool.execute(
+            'UPDATE "pictovideo_tasks" SET status=$1, error_message=$2, "updateAt"=$3 WHERE id=$4',
+            "failed", str(exc), now(), uuid.UUID(task_id),
+        )
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 # ---------- 后台任务 ----------
 
 async def _process_task(
@@ -599,13 +698,66 @@ async def start_process_v1(req: ProcessV1Request, background_tasks: BackgroundTa
         raise
 
 
-@app.get("/status/{main_id}", summary="查询任务状态")
-async def get_status(main_id: str):
+@app.post("/pictovideo", summary="图片 + MP3 生成视频（异步）")
+async def start_pictovideo(req: PictoVideoRequest, background_tasks: BackgroundTasks):
+    """提交图片转视频任务，返回任务 id；视频完成后返回 S3 地址。"""
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="database pool is not initialized")
+
+    task_id = str(uuid.uuid4())
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                '''
+                INSERT INTO "pictovideo_tasks" (id, image_url, mp3_url, status)
+                VALUES ($1, $2, $3, $4)
+                ''',
+                uuid.UUID(task_id), req.image_url, req.mp3_url, "pending",
+            )
+        background_tasks.add_task(_process_pictovideo_task, task_id, req.image_url, req.mp3_url)
+        return {"id": task_id, "status": "pending"}
+    except Exception:
+        logger.exception("pictovideo request failed: id=%s", task_id)
+        raise
+
+
+@app.get("/status/{id}", summary="查询任务状态")
+async def get_status(id: str):
     """
-    按 main_id 查询最新一条任务记录。
+    新接口按 pictovideo 任务 id 查询；旧接口仍可传 main_id 查询。
     completed 时 payload.s3_url 即为 S3 文件地址。
     """
+    if db_pool is None:
+        raise HTTPException(status_code=503, detail="database pool is not initialized")
+
+    try:
+        task_uuid = uuid.UUID(id)
+    except ValueError:
+        raise HTTPException(status_code=422, detail="id 必须是合法的 UUID")
+
+    # 新的 pictovideo 接口按任务 id 查询；找不到时继续兼容旧的 main_id 查询。
     async with db_pool.acquire() as conn:
+        pictovideo_row = await conn.fetchrow(
+            '''
+            SELECT id, status, payload, error_message, "createAt", "updateAt"
+            FROM "pictovideo_tasks"
+            WHERE id = $1
+            ''',
+            task_uuid,
+        )
+        if pictovideo_row is not None:
+            payload = json.loads(pictovideo_row["payload"]) if pictovideo_row["payload"] else None
+            s3_url = payload.get("s3_url") if isinstance(payload, dict) else None
+            return {
+                "id": str(pictovideo_row["id"]),
+                "status": pictovideo_row["status"],
+                "s3_url": s3_url,
+                "video_url": s3_url,
+                "error_message": pictovideo_row["error_message"],
+                "created_at": pictovideo_row["createAt"].isoformat() if pictovideo_row["createAt"] else None,
+                "updated_at": pictovideo_row["updateAt"].isoformat() if pictovideo_row["updateAt"] else None,
+            }
+
         row = await conn.fetchrow(
             """
             SELECT id, status, payload, error_message, "createAt", "updateAt"
@@ -621,18 +773,18 @@ async def get_status(main_id: str):
                 "updateAt" DESC
             LIMIT 1
             """,
-            uuid.UUID(main_id),
+            task_uuid,
         )
 
     if row is None:
-        raise HTTPException(status_code=404, detail=f"未找到 main_id={main_id} 的任务记录")
+        raise HTTPException(status_code=404, detail=f"未找到 id={id} 的任务记录")
 
     payload = json.loads(row["payload"]) if row["payload"] else None
     s3_url = payload.get("s3_url") if isinstance(payload, dict) else None
 
     return {
         "sub_id": str(row["id"]),
-        "main_id": main_id,
+        "main_id": id,
         "status": row["status"],
         "s3_url": s3_url,
         "error_message": row["error_message"],

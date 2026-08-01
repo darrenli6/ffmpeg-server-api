@@ -17,6 +17,7 @@
 - 可选混入背景音乐
 - 上传结果到 Amazon S3
 - 使用 PostgreSQL 保存任务状态
+- 支持图片 + MP3 生成静态图片视频
 - 支持 Docker 和 Railway 部署
 
 ## 工作流程
@@ -169,6 +170,36 @@ curl http://localhost:8001/status/11111111-1111-1111-1111-111111111111
 ```
 
 状态包括 `pending`、`processing`、`completed` 和 `failed`。任务完成后，响应中的 `s3_url` 会返回生成的视频地址。
+
+### 图片 + MP3 生成视频
+
+`/pictovideo` 接收一张图片 URL 和一个 MP3 URL。图片会保持静态，视频时长以 MP3 时长为准，任务完成后视频上传到 S3。
+
+```bash
+curl -X POST http://localhost:8001/pictovideo \
+  -H "Content-Type: application/json" \
+  -d '{
+    "image_url": "https://example.com/image.jpg",
+    "mp3_url": "https://example.com/music.mp3"
+  }'
+```
+
+返回任务 id：
+
+```json
+{
+  "id": "a3f2c1d0-0000-0000-0000-000000000000",
+  "status": "pending"
+}
+```
+
+使用该 id 查询：
+
+```bash
+curl http://localhost:8001/status/a3f2c1d0-0000-0000-0000-000000000000
+```
+
+任务完成时，`s3_url` 和 `video_url` 都是生成的视频地址。
 
 ## 部署到 Railway
 

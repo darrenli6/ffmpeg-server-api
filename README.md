@@ -206,3 +206,31 @@ No license has been specified yet. Add a license before accepting external contr
 
 
 
+
+
+ - 新增 POST /pictovideo
+  - 参数：
+
+    {
+      "image_url": "图片链接",
+      "mp3_url": "MP3链接"
+    }
+
+  - 返回任务 ID：
+
+    {
+      "id": "任务UUID",
+      "status": "pending"
+    }
+
+  - 使用 GET /status/{id} 查询状态
+  - 图片生成静态视频，视频时长以 MP3 为准
+  - 视频完成后自动上传 S3
+  - 返回 s3_url 和 video_url
+  - 保留原有 /process、/processV1 和旧状态查询兼容
+  - 增加 PostgreSQL 任务表自动初始化
+  - 已通过 Python 语法检查和本地 FFmpeg 合成测试
+
+  修改文件：
+
+  - api.py
