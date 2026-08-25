@@ -4,6 +4,7 @@ FastAPI 视频合并服务
 - POST /processV1     顺序拼接多个 MP4 并混入背景音乐
 - POST /pictovideo    接收图片 URL + MP3 URL + 可选 seconds，生成静态图片视频
 - GET  /status/{id}   查询任务状态及 S3 地址
+- GET  /ffmpeg-version 查询当前使用的 FFmpeg 版本
 """
 
 import asyncio
@@ -102,6 +103,35 @@ app = FastAPI(title="FFmpeg 视频合并服务", lifespan=lifespan)
 @app.get("/health", include_in_schema=False)
 async def health_check():
     return {"status": "ok"}
+
+
+@app.get("/ffmpeg-version", summary="查询 FFmpeg 版本")
+async def ffmpeg_version():
+    """返回当前服务实际使用的 FFmpeg 版本信息。"""
+    try:
+        result = subprocess.run(
+            [FFMPEG_BIN, "-version"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"找不到 FFmpeg 可执行文件: {FFMPEG_BIN}",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"FFmpeg 执行失败: {exc}",
+        ) from exc
+
+    output = (result.stdout or result.stderr).strip()
+    return {
+        "ffmpeg_bin": FFMPEG_BIN,
+        "version": output.splitlines()[0] if output else None,
+        "output": output,
+    }
 
 
 # ---------- 请求模型 ----------
