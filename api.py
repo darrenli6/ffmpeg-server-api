@@ -147,7 +147,7 @@ class ProcessRequest(BaseModel):
 class ProcessV1Request(BaseModel):
     main_id: str
     mp4_urls: list[str]   # 按顺序拼接的 MP4 URL 列表
-    mp3_url: str          # 背景音乐
+    mp3_url: Optional[str] = None  # 可选背景音乐
 
 
 class PictoVideoRequest(BaseModel):
@@ -328,6 +328,7 @@ def _upload_s3(file_path: str, s3_key: str) -> str:
         file_path, S3_BUCKET, s3_key,
         Config=_S3_TRANSFER_CONFIG,
         Callback=_S3ProgressLogger(file_path, s3_key),
+        ExtraArgs={"ContentType": "video/mp4"},
     )
     url = f"https://{S3_BUCKET}.s3.{AWS_REGION}.amazonaws.com/{s3_key}"
     logger.info("s3 upload completed: url=%s", url)
@@ -566,7 +567,7 @@ async def _process_v1_task(
     sub_id: str,
     main_id: str,
     mp4_urls: list[str],
-    mp3_url: str,
+    mp3_url: Optional[str],
 ) -> None:
     pool = db_pool
     tmp_dir = tempfile.mkdtemp(prefix=f"ffmpegv1_{sub_id}_")
@@ -585,27 +586,32 @@ async def _process_v1_task(
 
         # 准备文件路径
         mp4_paths = [os.path.join(tmp_dir, f"input_{i:03d}.mp4") for i in range(len(mp4_urls))]
-        mp3_path = os.path.join(tmp_dir, "music.mp3")
         concat_path = os.path.join(tmp_dir, "concat.mp4")
         output_path = os.path.join(tmp_dir, "output.mp4")
 
-        # 并行下载所有 MP4 + MP3
+        # 并行下载所有 MP4，背景音乐按需下载
         logger.info("v1 download start: sub_id=%s", sub_id)
         downloads = [loop.run_in_executor(None, _download, url, path) for url, path in zip(mp4_urls, mp4_paths)]
-        downloads.append(loop.run_in_executor(None, _download, mp3_url, mp3_path))
+        mp3_path = None
+        if mp3_url:
+            mp3_path = os.path.join(tmp_dir, "music.mp3")
+            downloads.append(loop.run_in_executor(None, _download, mp3_url, mp3_path))
         await asyncio.gather(*downloads)
         logger.info(
             "v1 download completed: sub_id=%s mp4_sizes=%s mp3_size=%s",
             sub_id,
             [os.path.getsize(p) for p in mp4_paths],
-            os.path.getsize(mp3_path),
+            os.path.getsize(mp3_path) if mp3_path else None,
         )
 
         # 拼接 MP4
         await loop.run_in_executor(None, _concat_mp4s, mp4_paths, concat_path, tmp_dir)
 
-        # 混入背景音乐
-        await loop.run_in_executor(None, _mix_background_music, concat_path, mp3_path, output_path, tmp_dir)
+        # 有背景音乐时混入；未提供时直接使用拼接结果
+        if mp3_path:
+            await loop.run_in_executor(None, _mix_background_music, concat_path, mp3_path, output_path, tmp_dir)
+        else:
+            output_path = concat_path
 
         # 上传 S3
         s3_key = f"ffmpeg-output/{main_id}/{sub_id}.mp4"
